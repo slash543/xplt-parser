@@ -8,6 +8,7 @@
 # Generated outputs
 *.csv
 *.png
+vtp_output/
 
 # Python
 __pycache__/
