@@ -8,6 +8,8 @@
 # Generated outputs
 *.csv
 *.png
+*.vtp
+*.pvd
 vtp_output/
 
 # Python
