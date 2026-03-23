@@ -179,13 +179,25 @@ def _find_surface_data(flat_arr: np.ndarray, target_id: int) -> Optional[np.ndar
 #  FEB file parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_feb(feb_path: Path) -> Tuple[Dict[int, str], Dict[str, str]]:
+def _parse_feb(feb_path: Path) -> Tuple[
+    Dict[int, str],
+    Dict[str, str],
+    List[Dict],
+    Dict[int, List[Tuple[float, float]]],
+]:
     """
     Returns:
-        mat_id_to_name : {material_id (int) → material_name (str)}
-        part_to_mat    : {part_name (str)   → material_name (str)}
+        mat_id_to_name  : {material_id (int) → material_name (str)}
+        part_to_mat     : {part_name (str)   → material_name (str)}
+        prescribed_z    : list of dicts with keys:
+                              magnitude (float, mm)
+                              lc_id     (int)
+                              relative  (bool)
+        load_curves     : {lc_id (int) → [(time, scale), ...]}
     """
     root = ET.parse(feb_path).getroot()
+
+    # ── Materials & domains ──────────────────────────────────────────────────
     mat_id_to_name: Dict[int, str] = {}
     for m in root.findall('./Material/material'):
         mat_id_to_name[int(m.get('id'))] = m.get('name', '')
@@ -194,7 +206,90 @@ def _parse_feb(feb_path: Path) -> Tuple[Dict[int, str], Dict[str, str]]:
     for d in root.findall('./MeshDomains/SolidDomain'):
         part_to_mat[d.get('name', '')] = d.get('mat', '')
 
-    return mat_id_to_name, part_to_mat
+    # ── Load curves ──────────────────────────────────────────────────────────
+    load_curves: Dict[int, List[Tuple[float, float]]] = {}
+    for lc in root.findall('.//load_controller'):
+        lc_id = int(lc.get('id', 0))
+        pts: List[Tuple[float, float]] = []
+        for pt in lc.findall('.//pt'):
+            t_val, s_val = pt.text.strip().split(',')
+            pts.append((float(t_val), float(s_val)))
+        if pts:
+            load_curves[lc_id] = pts
+
+    # ── Prescribed z-displacements (search both root Boundary and Step/Boundary) ──
+    prescribed_z: List[Dict] = []
+    for bc in root.findall('.//bc'):
+        if bc.get('type', '').lower() != 'prescribed displacement':
+            continue
+        dof_el = bc.find('dof')
+        if dof_el is None or dof_el.text.strip().lower() != 'z':
+            continue
+        val_el = bc.find('value')
+        if val_el is None:
+            continue
+        lc_id_str = val_el.get('lc')
+        if lc_id_str is None:
+            continue
+        prescribed_z.append({
+            'magnitude': float(val_el.text.strip()),
+            'lc_id':     int(lc_id_str),
+            'relative':  int(bc.findtext('relative', '0').strip()) == 1,
+        })
+
+    return mat_id_to_name, part_to_mat, prescribed_z, load_curves
+
+
+def _compute_insertion_depth(
+    timesteps: np.ndarray,
+    prescribed_z: List[Dict],
+    load_curves: Dict[int, List[Tuple[float, float]]],
+) -> np.ndarray:
+    """
+    Compute the catheter's absolute z-insertion depth (mm) at each simulation
+    timestep by replaying every prescribed z-displacement BC in chronological
+    order (sorted by the start time of their load curve).
+
+    Absolute BCs (relative=False) set the running position directly.
+    Relative BCs (relative=True) add an increment on top of the running position.
+
+    Returns a 1-D array of non-negative depths [mm], shape (n_timesteps,).
+    If no prescribed z-BCs are found in the .feb file a zero array is returned
+    and a warning is emitted.
+    """
+    if not prescribed_z or not load_curves:
+        warnings.warn(
+            'No prescribed z-displacement BCs found in .feb file.  '
+            'insertion_depth will be zero for all timesteps.'
+        )
+        return np.zeros(len(timesteps))
+
+    def _lc_start(bc: Dict) -> float:
+        pts = load_curves.get(bc['lc_id'], [(0.0, 0.0)])
+        return pts[0][0]
+
+    z = np.zeros(len(timesteps))
+
+    for bc in sorted(prescribed_z, key=_lc_start):
+        pts = load_curves.get(bc['lc_id'], [])
+        if not pts:
+            continue
+        lc_t = [p[0] for p in pts]
+        lc_v = [p[1] for p in pts]
+        # Evaluate load-curve scale at every simulation timestep.
+        # Before the curve starts → 0 (left=0).
+        # After the curve ends   → hold final value (right=lc_v[-1]).
+        scale = np.interp(timesteps, lc_t, lc_v, left=0.0, right=float(lc_v[-1]))
+        active = scale > 0.0
+
+        if bc['relative']:
+            # Incremental: add magnitude * scale on top of whatever z already is
+            z[active] += bc['magnitude'] * scale[active]
+        else:
+            # Absolute: directly set z where this BC is contributing
+            z[active] = bc['magnitude'] * scale[active]
+
+    return np.abs(z)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,7 +597,12 @@ class SimulationCase:
 
     def _load(self):
         print(f'[{self.label}] Parsing {self.feb_path.name} …')
-        self._mat_id_to_name, self._part_to_mat = _parse_feb(self.feb_path)
+        (
+            self._mat_id_to_name,
+            self._part_to_mat,
+            self._prescribed_z,
+            self._load_curves,
+        ) = _parse_feb(self.feb_path)
 
         print(f'[{self.label}] Reading {self.xplt_path.name} …')
         reader = _XpltReader(self.xplt_path)
@@ -525,6 +625,12 @@ class SimulationCase:
             self._contact_surf_id, self.n_facets, self.cp_var_id
         )
         self.n_timesteps = len(self.timesteps)
+
+        # Compute insertion depth from prescribed z-displacement BCs in .feb
+        self.insertion_depths = _compute_insertion_depth(
+            self.timesteps, self._prescribed_z, self._load_curves
+        )
+
         self._df = self._build_dataframe()
 
         print(
@@ -532,7 +638,8 @@ class SimulationCase:
             f'{self.n_facets} facets  |  '
             f'{self.n_timesteps} timesteps  |  '
             f't = [{self.timesteps[0]:.3f} … {self.timesteps[-1]:.3f}] s  |  '
-            f'max cp = {self.cp_matrix.max():.4f} MPa'
+            f'max cp = {self.cp_matrix.max():.4f} MPa  |  '
+            f'insertion depth = [{self.insertion_depths.min():.2f} … {self.insertion_depths.max():.2f}] mm'
         )
 
     def _pick_contact_surface(self) -> dict:
@@ -586,6 +693,61 @@ class SimulationCase:
     def df_facets(self) -> pd.DataFrame:
         """Per-facet geometry + peak contact pressure."""
         return self._df
+
+    # ── Surrogate column registry ──────────────────────────────────────────────
+    # Maps column_name → (description, method_name).
+    # Each method returns a flat 1-D array of length (n_timesteps * n_facets).
+    # To add a new variable:
+    #   1. Add a _col_<name>(self) method below that returns the array.
+    #   2. Register it here with a short description.
+    #   3. Add the column name to surrogate-lab's configs/config.yaml features list.
+    SURROGATE_COLUMNS: Dict[str, Tuple[str, str]] = {
+        'centroid_x':       ('Facet centroid X coordinate [mm]',  '_col_centroid_x'),
+        'centroid_y':       ('Facet centroid Y coordinate [mm]',  '_col_centroid_y'),
+        'centroid_z':       ('Facet centroid Z coordinate [mm]',  '_col_centroid_z'),
+        'facet_area':       ('Facet surface area [mm²]',          '_col_facet_area'),
+        'insertion_depth':  ('Catheter insertion depth [mm]',     '_col_insertion_depth'),
+        'contact_pressure': ('Contact pressure [MPa]',            '_col_contact_pressure'),
+    }
+
+    # ── Column computers (one per SURROGATE_COLUMNS entry) ────────────────────
+    # Per-facet quantities are tiled across timesteps; per-timestep quantities
+    # are repeated across facets — so every column has length n_timesteps*n_facets.
+
+    def _col_centroid_x(self) -> np.ndarray:
+        return np.tile(self.centroids[:, 0], self.n_timesteps)
+
+    def _col_centroid_y(self) -> np.ndarray:
+        return np.tile(self.centroids[:, 1], self.n_timesteps)
+
+    def _col_centroid_z(self) -> np.ndarray:
+        return np.tile(self.centroids[:, 2], self.n_timesteps)
+
+    def _col_facet_area(self) -> np.ndarray:
+        return np.tile(self.areas, self.n_timesteps)
+
+    def _col_insertion_depth(self) -> np.ndarray:
+        # insertion_depths is shape (n_timesteps,); repeat each value n_facets times
+        return np.repeat(self.insertion_depths, self.n_facets)
+
+    def _col_contact_pressure(self) -> np.ndarray:
+        # cp_matrix is (n_timesteps, n_facets); row-major flatten matches tile/repeat order
+        return self.cp_matrix.ravel()
+
+    def df_surrogate(self) -> pd.DataFrame:
+        """Return a tidy (facet × timestep) DataFrame compatible with surrogate-lab.
+
+        Each row represents one facet at one simulation timestep.
+        Column names and insertion_depth values are derived automatically from
+        the .feb file — no manual depth_scale needed.
+
+        Columns are defined by ``SURROGATE_COLUMNS``.  To expose a new variable
+        to surrogate-lab, add a ``_col_<name>`` method and register it there.
+        """
+        return pd.DataFrame({
+            col: getattr(self, method)()
+            for col, (_, method) in self.SURROGATE_COLUMNS.items()
+        })
 
     @property
     def total_area_mm2(self) -> float:
