@@ -18,6 +18,26 @@ Quickstart
     fig = xc.compare_csar([case_a, case_b], zmin=0.0, zmax=50.0)
     case_a.export_vtp()
 
+Multi-region CSAR (manual area adjustment)
+------------------------------------------
+Define several Z bands upfront to accumulate facet counts and contact areas
+across all bands at each timestep.  The raw contact-area time series lets you
+override the denominator before plotting.
+
+    z_bands = [(0.0, 20.0), (20.0, 40.0), (40.0, 60.0)]
+    band_labels = ["proximal", "mid", "distal"]
+
+    # Raw numbers — inspect or adjust before plotting
+    ts, band_stats, accumulated = case_a.compute_region_accumulation(z_bands)
+
+    # Plot all bands + accumulated CSAR; override denominator if needed
+    fig = xc.plot_csar_multi_regions(case_a, z_bands, band_labels,
+                                     total_area_override=120.0)
+
+    # Compare accumulated CSAR across cases
+    fig = xc.compare_csar_accumulated([case_a, case_b], z_bands,
+                                      total_area_overrides=[None, 120.0])
+
 Adding a new analysis function
 -------------------------------
     def my_metric(case: xc.SimulationCase, **kwargs):
@@ -638,6 +658,76 @@ class SimulationCase:
 
         return self.timesteps, csar, A_total_region
 
+    def compute_region_accumulation(
+        self,
+        z_bands: List[Tuple[float, float]],
+    ) -> Tuple[np.ndarray, List[dict], dict]:
+        """
+        Compute per-timestep facet counts and contact areas for multiple Z bands,
+        plus an accumulated total across all bands (union — no double-counting).
+
+        Define the bands upfront before running the script; this gives you the raw
+        numbers so you can override the denominator manually when computing CSAR.
+
+        Parameters
+        ----------
+        z_bands : list of (zmin, zmax) tuples defining each Z region [mm]
+
+        Returns
+        -------
+        timesteps  : float64 (n_timesteps,)
+        band_stats : list of dicts, one per band:
+                     {
+                       'zmin'               : float,
+                       'zmax'               : float,
+                       'n_facets_in_region' : int,
+                       'total_area_mm2'     : float,
+                       'contact_area_mm2'   : float64 (n_timesteps,),
+                       'n_contact_facets'   : int     (n_timesteps,),
+                     }
+        accumulated : dict with the same keys (except zmin/zmax) for the union
+                      of all bands combined.
+
+        Usage example
+        -------------
+            ts, bands, acc = case.compute_region_accumulation(
+                [(0.0, 20.0), (20.0, 40.0)]
+            )
+            # Manual CSAR with a custom denominator
+            my_total_area = 95.0   # e.g. from CAD or another reference
+            csar = acc['contact_area_mm2'] / my_total_area
+        """
+        band_stats: List[dict] = []
+        union_mask = np.zeros(self.n_facets, dtype=bool)
+
+        for zmin, zmax in z_bands:
+            mask = (self.centroids[:, 2] >= zmin) & (self.centroids[:, 2] <= zmax)
+            union_mask |= mask
+
+            A_region    = self.areas[mask]
+            cp_region   = self.cp_matrix[:, mask]
+            in_contact  = cp_region > 0
+            band_stats.append({
+                'zmin'               : float(zmin),
+                'zmax'               : float(zmax),
+                'n_facets_in_region' : int(mask.sum()),
+                'total_area_mm2'     : float(A_region.sum()),
+                'contact_area_mm2'   : (in_contact.astype(np.float64) @ A_region),
+                'n_contact_facets'   : in_contact.sum(axis=1).astype(int),
+            })
+
+        A_acc          = self.areas[union_mask]
+        cp_acc         = self.cp_matrix[:, union_mask]
+        in_contact_acc = cp_acc > 0
+        accumulated = {
+            'n_facets_in_region' : int(union_mask.sum()),
+            'total_area_mm2'     : float(A_acc.sum()),
+            'contact_area_mm2'   : (in_contact_acc.astype(np.float64) @ A_acc),
+            'n_contact_facets'   : in_contact_acc.sum(axis=1).astype(int),
+        }
+
+        return self.timesteps, band_stats, accumulated
+
     # ── VTP export ────────────────────────────────────────────────────────────
 
     def export_vtp(self, output_dir: Optional[Path] = None) -> Path:
@@ -924,5 +1014,195 @@ def csar_table(
         else:
             # Interpolate onto reference time axis if timestep counts differ
             data[case.label] = np.interp(ref_ts, ts, csar)
+
+    return pd.DataFrame(data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Multi-region CSAR helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_csar_multi_regions(
+    case:                SimulationCase,
+    z_bands:             List[Tuple[float, float]],
+    band_labels:         Optional[List[str]] = None,
+    total_area_override: Optional[float] = None,
+    save:                bool = True,
+) -> plt.Figure:
+    """
+    Plot CSAR vs time for each Z band individually, plus the accumulated total.
+
+    Parameters
+    ----------
+    case                : SimulationCase to analyse
+    z_bands             : list of (zmin, zmax) region definitions [mm]
+    band_labels         : display name for each band; auto-generated if None
+    total_area_override : use this value [mm²] as the accumulated-CSAR denominator
+                          instead of the sum of band areas.  Pass a float to
+                          normalise against a reference area (e.g. from CAD).
+    save                : write PNG to disk
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    ts, band_stats, accumulated = case.compute_region_accumulation(z_bands)
+
+    if band_labels is None:
+        band_labels = [
+            f'z=[{bs["zmin"]:.1f}, {bs["zmax"]:.1f}] mm  ({bs["n_facets_in_region"]} facets)'
+            for bs in band_stats
+        ]
+
+    denom    = total_area_override if total_area_override is not None else accumulated['total_area_mm2']
+    acc_csar = np.where(denom > 0, accumulated['contact_area_mm2'] / denom, 0.0)
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    denom_note = f'A_ref={denom:.1f} mm² (override)' if total_area_override is not None \
+                 else f'A_acc={denom:.1f} mm²'
+    fig.suptitle(
+        f'{case.label} — Multi-Region CSAR  |  {len(z_bands)} bands  |  {denom_note}',
+        fontsize=12,
+    )
+
+    # Left: CSAR per band + accumulated
+    ax = axes[0]
+    for i, (bs, lbl) in enumerate(zip(band_stats, band_labels)):
+        band_denom = bs['total_area_mm2']
+        band_csar  = np.where(band_denom > 0, bs['contact_area_mm2'] / band_denom, 0.0)
+        c = prop_cycle[i % len(prop_cycle)]
+        ax.plot(ts, band_csar, color=c, lw=1.2, ls='--',
+                label=f'{lbl}  (A={band_denom:.1f} mm²)')
+    ax.plot(ts, acc_csar, color='black', lw=2.0,
+            label=f'Accumulated  (A={denom:.1f} mm²)')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('CSAR  (A_contact / A_region)')
+    ax.set_title('CSAR per Band + Accumulated')
+    ax.set_ylim(0, max(1.0, acc_csar.max() * 1.1))
+    ax.legend(fontsize=8); ax.grid(alpha=0.4)
+
+    # Right: facets in contact per band + accumulated
+    ax = axes[1]
+    for i, (bs, lbl) in enumerate(zip(band_stats, band_labels)):
+        c = prop_cycle[i % len(prop_cycle)]
+        ax.plot(ts, bs['n_contact_facets'], color=c, lw=1.2, ls='--', label=lbl)
+    ax.plot(ts, accumulated['n_contact_facets'], color='black', lw=2.0, label='Accumulated')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Facets in contact (cp > 0)')
+    ax.set_title('Facets in Contact per Band')
+    ax.legend(fontsize=8); ax.grid(alpha=0.4)
+
+    plt.tight_layout()
+    if save:
+        p = Path(f'{case.label}_csar_multi_regions.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
+
+
+def compare_csar_accumulated(
+    cases:                List[SimulationCase],
+    z_bands:              List[Tuple[float, float]],
+    band_labels:          Optional[List[str]] = None,
+    total_area_overrides: Optional[List[Optional[float]]] = None,
+    save:                 bool = True,
+) -> plt.Figure:
+    """
+    Compare the accumulated (multi-band union) CSAR across multiple simulation
+    cases on a single axes.
+
+    The same z_bands definition is applied to every case.  Per-case denominator
+    overrides allow manual area adjustment for each simulation independently.
+
+    Parameters
+    ----------
+    cases                : list of SimulationCase
+    z_bands              : list of (zmin, zmax) band definitions applied to all cases
+    band_labels          : optional names for each band (shown in subtitle only)
+    total_area_overrides : per-case denominator override list, same length as cases.
+                           Use None for a specific case to use its computed area.
+                           Example: [None, 95.0, None]  — only case[1] is overridden.
+    save                 : write PNG to disk
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if total_area_overrides is None:
+        total_area_overrides = [None] * len(cases)
+    if len(total_area_overrides) != len(cases):
+        raise ValueError("total_area_overrides must have the same length as cases.")
+
+    if band_labels is None:
+        band_labels = [f'z=[{z0:.1f},{z1:.1f}]' for z0, z1 in z_bands]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax    = plt.subplots(figsize=(11, 6))
+    ax.set_title(
+        f'Accumulated CSAR Comparison — {len(z_bands)} bands:\n'
+        + ',  '.join(band_labels),
+        fontsize=11,
+    )
+
+    for i, (case, override) in enumerate(zip(cases, total_area_overrides)):
+        ts, _, accumulated = case.compute_region_accumulation(z_bands)
+        denom  = override if override is not None else accumulated['total_area_mm2']
+        csar   = np.where(denom > 0, accumulated['contact_area_mm2'] / denom, 0.0)
+        c      = prop_cycle[i % len(prop_cycle)]
+        label  = (
+            f'{case.label}  (A={denom:.1f} mm²'
+            + (' — override' if override is not None else '') + ')'
+        )
+        ax.plot(ts, csar, color=c, lw=1.8, label=label)
+        ax.fill_between(ts, csar, alpha=0.08, color=c)
+
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('CSAR  (A_contact / A_accumulated)')
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=9); ax.grid(alpha=0.4)
+
+    plt.tight_layout()
+    if save:
+        p = Path('csar_accumulated_comparison.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
+
+
+def region_accumulation_table(
+    cases:                List[SimulationCase],
+    z_bands:              List[Tuple[float, float]],
+    total_area_overrides: Optional[List[Optional[float]]] = None,
+) -> pd.DataFrame:
+    """
+    Return a wide DataFrame with per-case accumulated CSAR values over time.
+
+    Columns: time_s, <case_label_1>, <case_label_2>, ...
+
+    Parameters
+    ----------
+    cases                : list of SimulationCase
+    z_bands              : band definitions applied to all cases
+    total_area_overrides : per-case denominator override (None = use computed area)
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if total_area_overrides is None:
+        total_area_overrides = [None] * len(cases)
+
+    ref_ts = cases[0].timesteps
+    data: dict = {'time_s': ref_ts}
+
+    for case, override in zip(cases, total_area_overrides):
+        ts, _, accumulated = case.compute_region_accumulation(z_bands)
+        denom = override if override is not None else accumulated['total_area_mm2']
+        csar  = np.where(denom > 0, accumulated['contact_area_mm2'] / denom, 0.0)
+        if len(ts) != len(ref_ts):
+            csar = np.interp(ref_ts, ts, csar)
+        data[case.label] = csar
 
     return pd.DataFrame(data)
