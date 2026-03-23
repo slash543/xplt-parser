@@ -656,9 +656,10 @@ class SimulationCase:
         return max(self._surfaces.values(), key=lambda s: s.get('n_facets', 0))
 
     def _compute_tip_z_range(self) -> Tuple[float, float]:
+        _tip_names_lower = {n.strip().lower() for n in self._tip_material_names}
         tip_domains = [
             d for d in self._domains
-            if d.get('mat_name') in self._tip_material_names
+            if d.get('mat_name', '').strip().lower() in _tip_names_lower
         ]
         if tip_domains:
             all_node_idx = np.unique(
@@ -1368,3 +1369,74 @@ def region_accumulation_table(
         data[case.label] = csar
 
     return pd.DataFrame(data)
+
+
+def plot_max_cp_vs_depth(
+    cases:      List[SimulationCase],
+    z_bands_per_case: List[List[Tuple[float, float]]],
+    band_labels: Optional[List[str]] = None,
+    save:        bool = True,
+) -> plt.Figure:
+    """
+    Plot maximum contact pressure vs insertion depth for multiple simulation
+    cases on a single axes.
+
+    For each case, facets from all its z_bands are unioned first, then
+    max cp across that union is taken at each timestep.
+
+    Parameters
+    ----------
+    cases             : list of SimulationCase
+    z_bands_per_case  : per-case list of (zmin, zmax) bands.
+                        Must have the same length as `cases`.
+                        Example: [[(0,20),(20,40)], [(0,30)]]
+    band_labels       : optional per-case legend labels; defaults to case.label
+    save              : write PNG to disk
+
+    Usage
+    -----
+        fig = xc.plot_max_cp_vs_depth(
+            [case_a, case_b],
+            z_bands_per_case=[[(0, 20), (20, 40)], [(0, 35)]],
+        )
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if len(z_bands_per_case) != len(cases):
+        raise ValueError("z_bands_per_case must have the same length as cases.")
+    if band_labels is None:
+        band_labels = [c.label for c in cases]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, (case, z_bands, lbl) in enumerate(zip(cases, z_bands_per_case, band_labels)):
+        # Build union mask across all bands for this case
+        union_mask = np.zeros(case.n_facets, dtype=bool)
+        for zmin, zmax in z_bands:
+            union_mask |= (case.centroids[:, 2] >= zmin) & (case.centroids[:, 2] <= zmax)
+
+        if not union_mask.any():
+            warnings.warn(f"[{case.label}] No facets found in the specified z_bands; skipping.")
+            continue
+
+        cp_union = case.cp_matrix[:, union_mask]          # (n_timesteps, n_union_facets)
+        max_cp   = cp_union.max(axis=1)                   # (n_timesteps,)
+        depth    = case.insertion_depths                   # (n_timesteps,)
+
+        c = prop_cycle[i % len(prop_cycle)]
+        band_str = ', '.join(f'[{z0:.0f}–{z1:.0f}]' for z0, z1 in z_bands)
+        ax.plot(depth, max_cp, color=c, lw=1.8, label=f'{lbl}  ({band_str} mm)')
+
+    ax.set_xlabel('Insertion Depth (mm)')
+    ax.set_ylabel('Max Contact Pressure (MPa)')
+    ax.set_title('Max Contact Pressure vs Insertion Depth')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.4)
+    plt.tight_layout()
+
+    if save:
+        p = Path('max_cp_vs_depth.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
