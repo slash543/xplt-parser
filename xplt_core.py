@@ -8,8 +8,14 @@ Quickstart
 ----------
     import xplt_core as xc
 
-    case_a = xc.SimulationCase("run_a.feb", "run_a.xplt", label="Run A")
-    case_b = xc.SimulationCase("run_b.feb", "run_b.xplt", label="Run B")
+    case_a = xc.SimulationCase(
+        "run_a.feb", "run_a.xplt", label="Run A",
+        material_names=["catheter_body", "catheter_tip"],
+    )
+    case_b = xc.SimulationCase(
+        "run_b.feb", "run_b.xplt", label="Run B",
+        material_names=["catheter_body", "catheter_tip"],
+    )
 
     print(case_a.summary())
     xc.plot_geometry(case_a)
@@ -184,16 +190,23 @@ def _parse_feb(feb_path: Path) -> Tuple[
     Dict[str, str],
     List[Dict],
     Dict[int, List[Tuple[float, float]]],
+    List[Dict],
 ]:
     """
     Returns:
-        mat_id_to_name  : {material_id (int) → material_name (str)}
-        part_to_mat     : {part_name (str)   → material_name (str)}
-        prescribed_z    : list of dicts with keys:
-                              magnitude (float, mm)
-                              lc_id     (int)
-                              relative  (bool)
-        load_curves     : {lc_id (int) → [(time, scale), ...]}
+        mat_id_to_name          : {material_id (int) → material_name (str)}
+        part_to_mat             : {part_name (str)   → material_name (str)}
+        prescribed_z            : list of dicts with keys:
+                                      magnitude (float, mm)
+                                      lc_id     (int)
+                                      relative  (bool)
+        load_curves             : {lc_id (int) → {'pts': [(time, scale), ...], 'interp': str}}
+        sliding_contact_surfaces: list of dicts, one entry per surface involved in a
+                                  sliding contact:
+                                      surface_name  (str)  — matches xplt surface name
+                                      material      (str)  — material the surface belongs to
+                                      role          (str)  — 'primary' or 'secondary'
+                                      contact_name  (str)  — name of the contact definition
     """
     root = ET.parse(feb_path).getroot()
 
@@ -207,15 +220,16 @@ def _parse_feb(feb_path: Path) -> Tuple[
         part_to_mat[d.get('name', '')] = d.get('mat', '')
 
     # ── Load curves ──────────────────────────────────────────────────────────
-    load_curves: Dict[int, List[Tuple[float, float]]] = {}
+    load_curves: Dict[int, Dict] = {}
     for lc in root.findall('.//load_controller'):
-        lc_id = int(lc.get('id', 0))
+        lc_id  = int(lc.get('id', 0))
+        interp = (lc.findtext('interpolate') or 'LINEAR').strip().upper()
         pts: List[Tuple[float, float]] = []
         for pt in lc.findall('.//pt'):
             t_val, s_val = pt.text.strip().split(',')
             pts.append((float(t_val), float(s_val)))
         if pts:
-            load_curves[lc_id] = pts
+            load_curves[lc_id] = {'pts': pts, 'interp': interp}
 
     # ── Prescribed z-displacements (search both root Boundary and Step/Boundary) ──
     prescribed_z: List[Dict] = []
@@ -237,13 +251,97 @@ def _parse_feb(feb_path: Path) -> Tuple[
             'relative':  int(bc.findtext('relative', '0').strip()) == 1,
         })
 
-    return mat_id_to_name, part_to_mat, prescribed_z, load_curves
+    # ── Sliding contact surface → material mapping ───────────────────────────
+    # Build material → node-ID set from element connectivity
+    mat_node_ids: Dict[str, set] = {}
+    for elems_el in root.findall('./Mesh/Elements'):
+        part_name = elems_el.get('name', '')
+        mat_name  = part_to_mat.get(part_name, '')
+        if not mat_name:
+            continue
+        node_ids: set = set()
+        for elem in elems_el:
+            text = elem.text.strip() if elem.text else ''
+            if text:
+                node_ids.update(int(n) for n in text.split(','))
+        mat_node_ids.setdefault(mat_name, set()).update(node_ids)
+
+    # Build surface → node-ID set
+    surf_node_ids: Dict[str, set] = {}
+    for surf_el in root.findall('./Mesh/Surface'):
+        surf_name = surf_el.get('name', '')
+        node_ids = set()
+        for facet in surf_el:
+            text = facet.text.strip() if facet.text else ''
+            if text:
+                node_ids.update(int(n) for n in text.split(','))
+        surf_node_ids[surf_name] = node_ids
+
+    # Parse sliding contacts and resolve which material each surface belongs to
+    sliding_contact_surfaces: List[Dict] = []
+    for contact_el in root.findall('./Contact/contact'):
+        if 'sliding' not in contact_el.get('type', '').lower():
+            continue
+        contact_name = contact_el.get('name', '')
+        sp_name = contact_el.get('surface_pair', '')
+        sp_el   = root.find(f"./Mesh/SurfacePair[@name='{sp_name}']")
+        if sp_el is None:
+            continue
+        for role in ('primary', 'secondary'):
+            surf_name = (sp_el.findtext(role) or '').strip()
+            if not surf_name:
+                continue
+            s_nodes = surf_node_ids.get(surf_name, set())
+            # Find the material with the most node overlap
+            best_mat, best_count = '', 0
+            for mat_name, m_nodes in mat_node_ids.items():
+                count = len(s_nodes & m_nodes)
+                if count > best_count:
+                    best_mat, best_count = mat_name, count
+            sliding_contact_surfaces.append({
+                'surface_name': surf_name,
+                'material':     best_mat,
+                'role':         role,
+                'contact_name': contact_name,
+            })
+
+    return mat_id_to_name, part_to_mat, prescribed_z, load_curves, sliding_contact_surfaces
+
+
+def _smooth_step_interp(
+    t: np.ndarray,
+    lc_t: List[float],
+    lc_v: List[float],
+    left: float = 0.0,
+) -> np.ndarray:
+    """
+    Piecewise smooth-step interpolation matching FEBio's SMOOTH STEP mode.
+
+    Within each interval [t0, t1] the normalized position s = (t-t0)/(t1-t0)
+    is mapped through the cubic  f(s) = 3s² - 2s³  so that both value and
+    slope are continuous at every knot.
+    """
+    t   = np.asarray(t,   dtype=float)
+    lct = np.asarray(lc_t, dtype=float)
+    lcv = np.asarray(lc_v, dtype=float)
+
+    out = np.where(t < lct[0], left, lcv[-1]).astype(float)
+    for k in range(len(lct) - 1):
+        t0, t1 = lct[k], lct[k + 1]
+        v0, v1 = lcv[k], lcv[k + 1]
+        mask = (t >= t0) & (t < t1)
+        if not np.any(mask):
+            continue
+        s = (t[mask] - t0) / (t1 - t0) if t1 != t0 else np.ones(mask.sum())
+        out[mask] = v0 + (3*s**2 - 2*s**3) * (v1 - v0)
+    out[t == lct[-1]] = lcv[-1]
+    return out
 
 
 def _compute_insertion_depth(
     timesteps: np.ndarray,
     prescribed_z: List[Dict],
-    load_curves: Dict[int, List[Tuple[float, float]]],
+    load_curves: Dict[int, Dict],
 ) -> np.ndarray:
     """
     Compute the catheter's absolute z-insertion depth (mm) at each simulation
@@ -265,21 +363,26 @@ def _compute_insertion_depth(
         return np.zeros(len(timesteps))
 
     def _lc_start(bc: Dict) -> float:
-        pts = load_curves.get(bc['lc_id'], [(0.0, 0.0)])
-        return pts[0][0]
+        lc_data = load_curves.get(bc['lc_id'], {'pts': [(0.0, 0.0)], 'interp': 'LINEAR'})
+        return lc_data['pts'][0][0]
 
     z = np.zeros(len(timesteps))
 
     for bc in sorted(prescribed_z, key=_lc_start):
-        pts = load_curves.get(bc['lc_id'], [])
-        if not pts:
+        lc_data = load_curves.get(bc['lc_id'], None)
+        if not lc_data:
             continue
+        pts    = lc_data['pts']
+        interp = lc_data['interp']
         lc_t = [p[0] for p in pts]
         lc_v = [p[1] for p in pts]
         # Evaluate load-curve scale at every simulation timestep.
         # Before the curve starts → 0 (left=0).
-        # After the curve ends   → hold final value (right=lc_v[-1]).
-        scale = np.interp(timesteps, lc_t, lc_v, left=0.0, right=float(lc_v[-1]))
+        # After the curve ends   → hold final value.
+        if interp == 'SMOOTH STEP':
+            scale = _smooth_step_interp(timesteps, lc_t, lc_v, left=0.0)
+        else:
+            scale = np.interp(timesteps, lc_t, lc_v, left=0.0, right=float(lc_v[-1]))
         active = scale > 0.0
 
         if bc['relative']:
@@ -565,11 +668,11 @@ class SimulationCase:
     feb_path              : path to the .feb file
     xplt_path             : path to the .xplt file
     label                 : display name (defaults to .feb stem)
-    contact_surface_name  : substring to match against xplt surface names.
-                            If None, the surface with the most facets is used.
-    tip_material_names    : material names defining the 'tip' region.
-                            Used to derive tip_z_min / tip_z_max automatically.
-    tip_z_cutoff          : fallback tip cutoff [mm] when tip materials are absent.
+    contact_surface_name  : optional substring to match a specific contact surface in
+                            the xplt file.  When omitted the sliding-elastic primary
+                            surface is detected automatically from the .feb Contact
+                            definitions.
+    tip_z_cutoff          : fallback tip cutoff [mm] when no material bounds are found.
     cp_var_id             : variable ID for contact pressure in xplt STATE blocks
                             (default = 1 for FEBio v3 contact pressure).
     """
@@ -578,9 +681,8 @@ class SimulationCase:
         self,
         feb_path:             str | Path,
         xplt_path:            str | Path,
-        label:                Optional[str] = None,
-        contact_surface_name: Optional[str] = None,
-        tip_material_names:   Optional[set]  = None,
+        label:                Optional[str]  = None,
+        contact_surface_name: Optional[str]  = None,
         tip_z_cutoff:         float          = 50.0,
         cp_var_id:            int            = VAR_CONTACT_PRESSURE,
     ):
@@ -590,7 +692,6 @@ class SimulationCase:
         self.tip_z_cutoff         = tip_z_cutoff
         self.cp_var_id            = cp_var_id
         self._contact_surface_name = contact_surface_name
-        self._tip_material_names   = tip_material_names or {'catheter_tip'}
         self._load()
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -602,6 +703,7 @@ class SimulationCase:
             self._part_to_mat,
             self._prescribed_z,
             self._load_curves,
+            self._sliding_contact_surfaces,
         ) = _parse_feb(self.feb_path)
 
         print(f'[{self.label}] Reading {self.xplt_path.name} …')
@@ -611,19 +713,31 @@ class SimulationCase:
         self._domains  = reader.domains(self._mat_id_to_name)
         self._surfaces = reader.surfaces()
 
-        surf = self._pick_contact_surface()
+        # Auto-detect the sliding-elastic primary surface from .feb, or match by name
+        primary_sc = next(
+            (sc for sc in self._sliding_contact_surfaces if sc['role'] == 'primary'),
+            None
+        )
+        auto_name = primary_sc['surface_name'] if primary_sc else None
+        surf = self._pick_contact_surface(name=self._contact_surface_name or auto_name)
+
         self._contact_surf_id   = surf['id']
         self._contact_surf_name = surf['name']
-        self.facets             = surf['facets']          # (N_facets, 3)  int32
+        self.facets             = surf['facets']
         self.n_facets           = len(self.facets)
 
         self.centroids, self.areas = _facet_geometry(self.facets, self.coords)
-        self.tip_z_min, self.tip_z_max = self._compute_tip_z_range()
+
+        # Z range derived directly from the contact surface node coordinates
+        surf_z = self.coords[np.unique(self.facets.ravel()), 2]
+        self.tip_z_min = float(surf_z.min())
+        self.tip_z_max = float(surf_z.max())
 
         print(f'[{self.label}] Parsing {reader.n_states()} timesteps …')
         self.timesteps, self.cp_matrix = reader.parse_states(
             self._contact_surf_id, self.n_facets, self.cp_var_id
         )
+
         self.n_timesteps = len(self.timesteps)
 
         # Compute insertion depth from prescribed z-displacement BCs in .feb
@@ -642,36 +756,28 @@ class SimulationCase:
             f'insertion depth = [{self.insertion_depths.min():.2f} … {self.insertion_depths.max():.2f}] mm'
         )
 
-    def _pick_contact_surface(self) -> dict:
-        if self._contact_surface_name:
-            needle = self._contact_surface_name.lower()
+    def _pick_contact_surface(self, name: Optional[str] = None) -> dict:
+        needle_name = name or self._contact_surface_name
+        if needle_name:
+            needle = needle_name.lower()
             for s in self._surfaces.values():
                 if needle in s.get('name', '').lower():
                     return s
             warnings.warn(
-                f"[{self.label}] No surface matching '{self._contact_surface_name}'; "
+                f"[{self.label}] No surface matching '{needle_name}'; "
                 "falling back to the surface with the most facets."
             )
         # Fallback: surface with most facets (usually the primary contact surface)
         return max(self._surfaces.values(), key=lambda s: s.get('n_facets', 0))
 
-    def _compute_tip_z_range(self) -> Tuple[float, float]:
-        _tip_names_lower = {n.strip().lower() for n in self._tip_material_names}
-        tip_domains = [
-            d for d in self._domains
-            if d.get('mat_name', '').strip().lower() in _tip_names_lower
-        ]
-        if tip_domains:
-            all_node_idx = np.unique(
-                np.concatenate([d['elements'][:, 1:].ravel() for d in tip_domains])
-            )
-            z = self.coords[all_node_idx, 2]
-            return float(z.min()), float(z.max())
-        warnings.warn(
-            f"[{self.label}] Tip material(s) {self._tip_material_names} not found. "
-            f"Using z < {self.tip_z_cutoff} mm as the tip region."
-        )
-        return 0.0, self.tip_z_cutoff
+    def _validate_z_bands(self, z_bands: List[Tuple[float, float]]) -> None:
+        """Warn if any z-band extends outside the contact surface Z bounds."""
+        for i, (zlo, zhi) in enumerate(z_bands):
+            if zlo < self.tip_z_min or zhi > self.tip_z_max:
+                warnings.warn(
+                    f"[{self.label}] Band {i} z=[{zlo:.2f}, {zhi:.2f}] mm is outside "
+                    f"contact surface bounds [{self.tip_z_min:.2f}, {self.tip_z_max:.2f}] mm."
+                )
 
     def _build_dataframe(self) -> pd.DataFrame:
         tip_mask = (
@@ -860,6 +966,7 @@ class SimulationCase:
             my_total_area = 95.0   # e.g. from CAD or another reference
             csar = acc['contact_area_mm2'] / my_total_area
         """
+        self._validate_z_bands(z_bands)
         band_stats: List[dict] = []
         union_mask = np.zeros(self.n_facets, dtype=bool)
 
@@ -1440,3 +1547,50 @@ def plot_max_cp_vs_depth(
         fig.savefig(p, dpi=150)
         print(f'Saved: {p}')
     return fig
+
+def plot_insertion_depth_vs_time(
+    cases:      List[SimulationCase],
+    save:        bool = True,
+) -> plt.Figure:
+    """
+    Plot insertion depth vs time for multiple simulation
+    cases on a single axes.
+
+    Parameters
+    ----------
+    cases             : list of SimulationCase
+    save              : write PNG to disk
+
+    Usage
+    -----
+        fig = xc.plot_insertion_depth_vs_time(
+            [case_a, case_b],
+        )
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, case in enumerate(cases):
+        time     = case.timesteps
+        depth    = case.insertion_depths                   # (n_timesteps,)
+        c = prop_cycle[i % len(prop_cycle)]
+        ax.plot(time, depth, color=c, lw=1.8, label=f'{case.label}')
+
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Insertion Depth (mm)')
+    ax.set_title('Insertion Depth vs Time')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.4)
+    plt.tight_layout()
+
+    if save:
+        p = Path('insertion_depth_vs_time.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
+
+# Alias for backwards compatibility
+csar_accumulated_table = region_accumulation_table
