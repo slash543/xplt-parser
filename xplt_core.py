@@ -568,6 +568,42 @@ class _XpltReader:
             np.stack(rows),
         )
 
+    def parse_states_vector(
+        self,
+        surface_id:   int,
+        n_facets:     int,
+        var_id:       int,
+        n_components: int = 3,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Like parse_states but for vector-valued surface variables
+        (e.g. VAR_SURFACE_TRACTION with 3 components per facet).
+
+        Returns
+        -------
+        timesteps   : float64 (n_states,)
+        data_matrix : float32 (n_states, n_facets, n_components)
+        """
+        timesteps: List[float]      = []
+        rows:      List[np.ndarray] = []
+        zeros = np.zeros((n_facets, n_components), dtype='f4')
+
+        for i in range(self.n_states()):
+            sc   = self._state_chunk(i)
+            timesteps.append(self._timestep(sc))
+            flat = self._surface_var_flat(sc, var_id)
+            if flat is not None:
+                surf_data = _find_surface_data(flat, surface_id)
+                if surf_data is not None and len(surf_data) == n_facets * n_components:
+                    rows.append(surf_data.reshape(n_facets, n_components).copy())
+                    continue
+            rows.append(zeros.copy())
+
+        return (
+            np.array(timesteps, dtype=np.float64),
+            np.stack(rows),
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Geometry utilities
@@ -738,6 +774,18 @@ class SimulationCase:
         self.timesteps, self.cp_matrix = reader.parse_states(
             self._contact_surf_id, self.n_facets, self.cp_var_id
         )
+
+        # Parse surface traction vectors (3 components per facet)
+        _, self.traction_matrix = reader.parse_states_vector(
+            self._contact_surf_id, self.n_facets, VAR_SURFACE_TRACTION
+        )
+        # Reaction force = sum over facets of (traction_vector * area)
+        # Units: MPa * mm² = N
+        _force_vecs = (
+            self.traction_matrix.astype(np.float64)
+            * self.areas[:, np.newaxis]
+        ).sum(axis=1)                                           # (n_timesteps, 3)
+        self.reaction_force_magnitude = np.linalg.norm(_force_vecs, axis=1)  # (n_timesteps,)
 
         self.n_timesteps = len(self.timesteps)
 
@@ -1592,3 +1640,218 @@ def plot_insertion_depth_vs_time(
 
 # Alias for backwards compatibility
 csar_accumulated_table = region_accumulation_table
+
+
+def plot_reaction_force_vs_depth(
+    cases:            List[SimulationCase],
+    z_bands_per_case: List[List[Tuple[float, float]]],
+    band_labels:      Optional[List[str]] = None,
+    save:             bool = True,
+) -> plt.Figure:
+    """
+    Plot reaction force magnitude vs insertion depth for multiple simulation cases.
+
+    The reaction force is the vector sum of (traction × facet_area) over all
+    facets in the union of the specified z-bands.  Units: N  (MPa · mm²).
+
+    Parameters
+    ----------
+    cases             : list of SimulationCase
+    z_bands_per_case  : per-case list of (zmin, zmax) bands.
+                        Must have the same length as `cases`.
+    band_labels       : optional per-case legend labels; defaults to case.label
+    save              : write PNG to disk
+
+    Usage
+    -----
+        fig = xc.plot_reaction_force_vs_depth(
+            [case_a, case_b],
+            z_bands_per_case=[[(0, 20), (20, 40)], [(0, 35)]],
+        )
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if len(z_bands_per_case) != len(cases):
+        raise ValueError("z_bands_per_case must have the same length as cases.")
+    if band_labels is None:
+        band_labels = [c.label for c in cases]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, (case, z_bands, lbl) in enumerate(zip(cases, z_bands_per_case, band_labels)):
+        union_mask = np.zeros(case.n_facets, dtype=bool)
+        for zmin, zmax in z_bands:
+            union_mask |= (case.centroids[:, 2] >= zmin) & (case.centroids[:, 2] <= zmax)
+
+        if not union_mask.any():
+            warnings.warn(f"[{case.label}] No facets found in the specified z_bands; skipping.")
+            continue
+
+        traction_union = case.traction_matrix[:, union_mask, :].astype(np.float64)  # (n_ts, n, 3)
+        areas_union    = case.areas[union_mask]                                      # (n,)
+        force_vecs     = (traction_union * areas_union[:, np.newaxis]).sum(axis=1)   # (n_ts, 3)
+        force_mag      = np.linalg.norm(force_vecs, axis=1)                          # (n_ts,)
+
+        c = prop_cycle[i % len(prop_cycle)]
+        band_str = ', '.join(f'[{z0:.0f}–{z1:.0f}]' for z0, z1 in z_bands)
+        ax.plot(case.insertion_depths, force_mag, color=c, lw=1.8,
+                label=f'{lbl}  ({band_str} mm)')
+
+    ax.set_xlabel('Insertion Depth (mm)')
+    ax.set_ylabel('Reaction Force Magnitude (N)')
+    ax.set_title('Reaction Force Magnitude vs Insertion Depth')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.4)
+    plt.tight_layout()
+
+    if save:
+        p = Path('reaction_force_vs_depth.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
+
+
+def plot_traction_vs_depth(
+    cases:            List[SimulationCase],
+    z_bands_per_case: List[List[Tuple[float, float]]],
+    band_labels:      Optional[List[str]] = None,
+    save:             bool = True,
+) -> plt.Figure:
+    """
+    Plot maximum contact traction magnitude vs insertion depth for multiple cases.
+
+    At each timestep the maximum Euclidean norm of the traction vector is taken
+    over all facets in the union of the specified z-bands.  Units: MPa.
+
+    Parameters
+    ----------
+    cases             : list of SimulationCase
+    z_bands_per_case  : per-case list of (zmin, zmax) bands.
+                        Must have the same length as `cases`.
+    band_labels       : optional per-case legend labels; defaults to case.label
+    save              : write PNG to disk
+
+    Usage
+    -----
+        fig = xc.plot_traction_vs_depth(
+            [case_a, case_b],
+            z_bands_per_case=[[(0, 20), (20, 40)], [(0, 35)]],
+        )
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if len(z_bands_per_case) != len(cases):
+        raise ValueError("z_bands_per_case must have the same length as cases.")
+    if band_labels is None:
+        band_labels = [c.label for c in cases]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, (case, z_bands, lbl) in enumerate(zip(cases, z_bands_per_case, band_labels)):
+        union_mask = np.zeros(case.n_facets, dtype=bool)
+        for zmin, zmax in z_bands:
+            union_mask |= (case.centroids[:, 2] >= zmin) & (case.centroids[:, 2] <= zmax)
+
+        if not union_mask.any():
+            warnings.warn(f"[{case.label}] No facets found in the specified z_bands; skipping.")
+            continue
+
+        traction_union = case.traction_matrix[:, union_mask, :].astype(np.float64)  # (n_ts, n, 3)
+        traction_mag   = np.linalg.norm(traction_union, axis=2)                     # (n_ts, n)
+        max_traction   = traction_mag.max(axis=1)                                   # (n_ts,)
+
+        c = prop_cycle[i % len(prop_cycle)]
+        band_str = ', '.join(f'[{z0:.0f}–{z1:.0f}]' for z0, z1 in z_bands)
+        ax.plot(case.insertion_depths, max_traction, color=c, lw=1.8,
+                label=f'{lbl}  ({band_str} mm)')
+
+    ax.set_xlabel('Insertion Depth (mm)')
+    ax.set_ylabel('Max Contact Traction Magnitude (MPa)')
+    ax.set_title('Max Contact Traction vs Insertion Depth')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.4)
+    plt.tight_layout()
+
+    if save:
+        p = Path('traction_vs_depth.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
+
+
+def plot_csar_vs_depth(
+    cases:                List[SimulationCase],
+    z_bands_per_case:     List[List[Tuple[float, float]]],
+    total_area_overrides: Optional[List[Optional[float]]] = None,
+    band_labels:          Optional[List[str]] = None,
+    save:                 bool = True,
+) -> plt.Figure:
+    """
+    Plot accumulated (multi-band union) CSAR vs insertion depth for multiple cases.
+
+    This mirrors compare_csar_accumulated but uses insertion depth as the x-axis
+    instead of simulation time.
+
+    Parameters
+    ----------
+    cases                : list of SimulationCase
+    z_bands_per_case     : per-case list of (zmin, zmax) band definitions.
+                           Must have the same length as `cases`.
+    total_area_overrides : per-case denominator override list (same length as cases).
+                           Use None for a specific case to use its computed area.
+    band_labels          : optional per-case legend labels; defaults to case.label
+    save                 : write PNG to disk
+
+    Usage
+    -----
+        fig = xc.plot_csar_vs_depth(
+            [case_a, case_b],
+            z_bands_per_case=[[(0, 20), (20, 40)], [(0, 35)]],
+            total_area_overrides=[None, 95.0],
+        )
+    """
+    if not cases:
+        raise ValueError("No cases provided.")
+    if len(z_bands_per_case) != len(cases):
+        raise ValueError("z_bands_per_case must have the same length as cases.")
+    if total_area_overrides is None:
+        total_area_overrides = [None] * len(cases)
+    if len(total_area_overrides) != len(cases):
+        raise ValueError("total_area_overrides must have the same length as cases.")
+    if band_labels is None:
+        band_labels = [c.label for c in cases]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    fig, ax    = plt.subplots(figsize=(11, 6))
+    ax.set_title('Contact Surface Area Ratio vs Insertion Depth', fontsize=11)
+
+    for i, (case, z_bands, override, lbl) in enumerate(
+        zip(cases, z_bands_per_case, total_area_overrides, band_labels)
+    ):
+        _, _, accumulated = case.compute_region_accumulation(z_bands)
+        denom  = override if override is not None else accumulated['total_area_mm2']
+        csar   = np.where(denom > 0, accumulated['contact_area_mm2'] / denom, 0.0)
+
+        c        = prop_cycle[i % len(prop_cycle)]
+        band_str = ', '.join(f'[{z0:.1f},{z1:.1f}]' for z0, z1 in z_bands)
+        label    = (
+            f'{lbl}  (bands: {band_str} mm,  A={denom:.1f} mm²'
+            + (' — override' if override is not None else '') + ')'
+        )
+        ax.plot(case.insertion_depths, csar, color=c, lw=1.8, label=label)
+        ax.fill_between(case.insertion_depths, csar, alpha=0.08, color=c)
+
+    ax.set_xlabel('Insertion Depth (mm)')
+    ax.set_ylabel('CSAR  (A_contact / A_accumulated)')
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.4)
+    plt.tight_layout()
+
+    if save:
+        p = Path('csar_vs_depth.png')
+        fig.savefig(p, dpi=150)
+        print(f'Saved: {p}')
+    return fig
