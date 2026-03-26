@@ -40,8 +40,9 @@ override the denominator before plotting.
     fig = xc.plot_csar_multi_regions(case_a, z_bands, band_labels,
                                      total_area_override=120.0)
 
-    # Compare accumulated CSAR across cases
-    fig = xc.compare_csar_accumulated([case_a, case_b], z_bands,
+    # Compare accumulated CSAR across cases (per-case band definitions)
+    fig = xc.compare_csar_accumulated([case_a, case_b],
+                                      z_bands_per_case=[z_bands, z_bands],
                                       total_area_overrides=[None, 120.0])
 
 Adding a new analysis function
@@ -1374,8 +1375,7 @@ def plot_csar_multi_regions(
 
 def compare_csar_accumulated(
     cases:                List[SimulationCase],
-    z_bands:              List[Tuple[float, float]],
-    band_labels:          Optional[List[str]] = None,
+    z_bands_per_case:     List[List[Tuple[float, float]]],
     total_area_overrides: Optional[List[Optional[float]]] = None,
     save:                 bool = True,
 ) -> plt.Figure:
@@ -1383,14 +1383,16 @@ def compare_csar_accumulated(
     Compare the accumulated (multi-band union) CSAR across multiple simulation
     cases on a single axes.
 
-    The same z_bands definition is applied to every case.  Per-case denominator
-    overrides allow manual area adjustment for each simulation independently.
+    Each case uses its own z_bands definition, allowing different band ranges
+    per simulation.  Per-case denominator overrides allow manual area adjustment
+    for each simulation independently.
 
     Parameters
     ----------
     cases                : list of SimulationCase
-    z_bands              : list of (zmin, zmax) band definitions applied to all cases
-    band_labels          : optional names for each band (shown in subtitle only)
+    z_bands_per_case     : per-case list of (zmin, zmax) band definitions.
+                           Must have the same length as `cases`.
+                           Example: [[(0,20),(20,40)], [(0,35)]]
     total_area_overrides : per-case denominator override list, same length as cases.
                            Use None for a specific case to use its computed area.
                            Example: [None, 95.0, None]  — only case[1] is overridden.
@@ -1402,29 +1404,25 @@ def compare_csar_accumulated(
     """
     if not cases:
         raise ValueError("No cases provided.")
+    if len(z_bands_per_case) != len(cases):
+        raise ValueError("z_bands_per_case must have the same length as cases.")
     if total_area_overrides is None:
         total_area_overrides = [None] * len(cases)
     if len(total_area_overrides) != len(cases):
         raise ValueError("total_area_overrides must have the same length as cases.")
 
-    if band_labels is None:
-        band_labels = [f'z=[{z0:.1f},{z1:.1f}]' for z0, z1 in z_bands]
-
     prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
     fig, ax    = plt.subplots(figsize=(11, 6))
-    ax.set_title(
-        f'Accumulated CSAR Comparison — {len(z_bands)} bands:\n'
-        + ',  '.join(band_labels),
-        fontsize=11,
-    )
+    ax.set_title('Accumulated CSAR Comparison', fontsize=11)
 
-    for i, (case, override) in enumerate(zip(cases, total_area_overrides)):
+    for i, (case, z_bands, override) in enumerate(zip(cases, z_bands_per_case, total_area_overrides)):
         ts, _, accumulated = case.compute_region_accumulation(z_bands)
         denom  = override if override is not None else accumulated['total_area_mm2']
         csar   = np.where(denom > 0, accumulated['contact_area_mm2'] / denom, 0.0)
         c      = prop_cycle[i % len(prop_cycle)]
+        band_str = ', '.join(f'[{z0:.1f},{z1:.1f}]' for z0, z1 in z_bands)
         label  = (
-            f'{case.label}  (A={denom:.1f} mm²'
+            f'{case.label}  (bands: {band_str} mm,  A={denom:.1f} mm²'
             + (' — override' if override is not None else '') + ')'
         )
         ax.plot(ts, csar, color=c, lw=1.8, label=label)
